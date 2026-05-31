@@ -406,6 +406,7 @@ def get_report(job_id: str):
             "carrier_total": carrier_total,
             "total_delta": pa_total - carrier_total,
             "matched_count": matched_count,
+            "exact_match_count": matched_count,
             "missing_count": missing_count,
             "only_in_carrier_count": only_in_carrier,
             "qty_diff_count": qty_diff_count,

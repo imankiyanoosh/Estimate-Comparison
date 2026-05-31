@@ -1,10 +1,10 @@
-# Xactimate Estimate Reconciliation App
+# Xactimate Estimate Reconciliation MVP
 
-A web app that compares two Xactimate-generated PDF estimates — insurance/carrier vs public-adjuster rebuild — and produces a detailed reconciliation report showing scope, quantity, and price discrepancies at line, room, category, and total levels.
+A full-stack web app that compares two Xactimate-generated PDF estimates (carrier vs PA) and produces an interactive reconciliation report plus a downloadable PDF.
 
 ## Architecture
 
-- **Backend**: FastAPI (Python) + SQLite + PyMuPDF + pdfplumber + rapidfuzz
+- **Backend**: FastAPI + SQLAlchemy (SQLite) + PyMuPDF + pdfplumber + rapidfuzz + scikit-learn
 - **Frontend**: React 18 + TypeScript + Vite + Tailwind CSS
 
 ## Quick Start
@@ -25,36 +25,21 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173
+The frontend dev server runs at http://localhost:5173 and proxies `/api` requests to the backend at port 8000.
 
-## Features
+## How It Works
 
-- Upload carrier and PA estimate PDFs
-- Extracts line items using PyMuPDF (text-based PDFs) with pdfplumber fallback
-- 3-tier matching engine: exact code → fuzzy description → semantic TF-IDF
-- QA checks: validates qty × unit_price ≈ RCV for each extracted line
-- Interactive report with tabs: Summary, By Room, By Category, Line Items, Financial Deltas, Review Queue
-- Export to PDF (ReportLab) and CSV
-- Human review queue for low-confidence matches
-- Price list mismatch warning
+1. Upload two Xactimate PDFs (carrier/insurance estimate + PA/rebuild estimate)
+2. Backend extracts all line items using PyMuPDF with column-detection, falling back to pdfplumber
+3. Three-tier matching engine (exact code → fuzzy description → TF-IDF semantic) with Hungarian algorithm assignment
+4. Interactive report with tabs: Summary, By Room, By Category, Line Items, Financial Deltas, Review Queue
+5. Export as PDF (ReportLab) or CSV
 
-## Match States
+## API Endpoints
 
-| State | Meaning |
-|-------|---------|
-| `exact_match` | Same item, same values |
-| `qty_diff` | Same item, quantity reduced by carrier |
-| `price_diff` | Same item, price reduced by carrier |
-| `scope_diff` | Matched but total differs |
-| `missing_from_carrier` | In PA estimate but NOT in carrier — supplement opportunity |
-| `only_in_carrier` | In carrier but not in PA estimate |
-| `unresolved` | Low-confidence match — needs human review |
-
-## Roadmap
-
-- Phase 2: Building code upgrade / ordinance-or-law suggestion engine
-- Phase 2: Estimate quality review ("what did we miss?")
-- Phase 2: Supplement narrative generation via Claude
-- Phase 3: OCR support for scanned PDFs (AWS Textract / Azure Document Intelligence)
-- Phase 3: ESX file ingestion
-- Phase 3: Carrier-specific comparison profiles
+- `POST /api/jobs` — Upload two PDFs, start processing
+- `GET /api/jobs/{id}` — Get job status
+- `GET /api/jobs/{id}/report` — Get full reconciliation report JSON
+- `GET /api/jobs/{id}/export/pdf` — Download PDF report
+- `GET /api/jobs/{id}/export/csv` — Download CSV of line matches
+- `POST /api/jobs/{id}/matches/{match_id}/review` — Mark match as human-reviewed
