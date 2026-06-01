@@ -1,11 +1,20 @@
+import os
 import uuid
 from datetime import datetime
 from sqlalchemy import create_engine, Column, String, Float, Integer, Boolean, Text, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
-DATABASE_URL = "sqlite:///./estimate_comparison.db"
+# Support Railway's DATABASE_URL (Postgres) or fall back to SQLite in /tmp
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:////tmp/estimate_comparison.db")
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# Railway provides postgres:// but SQLAlchemy needs postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
