@@ -30,7 +30,6 @@ const FILTERS: { key: FilterType; label: string }[] = [
 
 export default function LineItemTable({
   matches,
-  jobId,
   reviewMode = false,
 }: {
   matches: LineMatch[]
