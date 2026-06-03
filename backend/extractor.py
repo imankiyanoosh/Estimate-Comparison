@@ -210,11 +210,11 @@ Rules:
         return result
 
     except json.JSONDecodeError as e:
-        logger.warning(f"  Page {page_num + 1}: JSON parse error — {e}")
-        return {"line_items": [], "page_type": page_type}
+        logger.error(f"  Page {page_num + 1}: JSON parse error — {e} | raw={raw[:300] if 'raw' in dir() else 'N/A'}")
+        return {"line_items": [], "page_type": page_type, "_error": f"JSON parse: {e}"}
     except Exception as e:
-        logger.warning(f"  Page {page_num + 1}: Claude error — {e}")
-        return {"line_items": [], "page_type": page_type}
+        logger.error(f"  Page {page_num + 1}: OpenRouter error — {type(e).__name__}: {e}")
+        return {"line_items": [], "page_type": page_type, "_error": str(e)}
 
 
 def coerce_float(val) -> float:

@@ -525,3 +525,37 @@ def review_match(job_id: str, match_id: str, action: dict):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/api/test-vision")
+def test_vision():
+    """Test OpenRouter connectivity and vision capability."""
+    import os, base64
+    from openai import OpenAI
+
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    model = os.environ.get("VISION_MODEL", "google/gemini-2.0-flash-exp:free")
+
+    if not api_key:
+        return {"ok": False, "error": "OPENROUTER_API_KEY is not set", "model": model}
+
+    # 1x1 white PNG
+    tiny_png = base64.standard_b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI6QAAAABJRU5ErkJggg=="
+    )
+    img_b64 = base64.standard_b64encode(tiny_png).decode()
+
+    try:
+        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=20,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                {"type": "text", "text": "Reply with just the word OK."},
+            ]}],
+        )
+        reply = resp.choices[0].message.content
+        return {"ok": True, "model": model, "reply": reply}
+    except Exception as e:
+        return {"ok": False, "model": model, "error": f"{type(e).__name__}: {e}"}
