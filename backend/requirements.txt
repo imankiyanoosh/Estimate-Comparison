@@ -13,3 +13,8 @@ reportlab==4.2.5
 openai==1.54.0
 python-dotenv==1.0.1
 aiofiles==24.1.0
+paddlepaddle==2.6.2
+paddleocr==2.8.1
+opencv-python-headless==4.10.0.84
+shapely==2.0.6
+Pillow>=10.0.0

@@ -1,23 +1,40 @@
 """
-Xactimate PDF Extractor — Claude Vision, page-by-page.
-Each page is rendered to an image and sent to Claude for structured extraction.
+Xactimate PDF Extractor — Enhanced Pipeline
+  PDF → PyMuPDF → Page Split → PaddleOCR (scanned pages) →
+  Layout Detection → LLM Extraction → JSON
 """
 import re
 import json
 import base64
 import logging
 import os
+import io
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-# Any vision-capable model on OpenRouter works, e.g.:
-#   google/gemini-2.0-flash-exp:free
-#   anthropic/claude-sonnet-4-5
-#   openai/gpt-4o
-#   openai/gpt-4o-mini
 VISION_MODEL = os.environ.get("VISION_MODEL", "google/gemini-2.0-flash-exp:free")
+
+# ---------------------------------------------------------------------------
+# PaddleOCR — optional, graceful fallback
+# ---------------------------------------------------------------------------
+PADDLE_AVAILABLE = False
+_paddle_ocr = None
+
+def _init_paddle():
+    global PADDLE_AVAILABLE, _paddle_ocr
+    if _paddle_ocr is not None:
+        return
+    try:
+        from paddleocr import PaddleOCR
+        _paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+        PADDLE_AVAILABLE = True
+        logger.info("PaddleOCR initialised successfully")
+    except Exception as e:
+        logger.warning(f"PaddleOCR not available ({e}) — scanned pages will use vision-only mode")
+        PADDLE_AVAILABLE = False
+
 
 CATEGORY_NAMES = {
     "ACT": "Acoustical Treatment", "APL": "Appliances", "AWN": "Awnings",
@@ -41,23 +58,115 @@ CATEGORY_NAMES = {
 }
 
 
-def normalize_description(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+# ---------------------------------------------------------------------------
+# Step 1 — PyMuPDF helpers
+# ---------------------------------------------------------------------------
 
-
-def render_page_to_png(page, dpi: int = 150) -> bytes:
+def render_page_to_png(page, dpi: int = 200) -> bytes:
     """Render a PyMuPDF page to PNG bytes."""
     pix = page.get_pixmap(dpi=dpi)
     return pix.tobytes("png")
 
 
-def detect_page_type(page_text: str) -> str:
-    """Quick heuristic to classify a page before sending to Claude."""
-    lower = page_text.lower()
+def get_pymupdf_text(page) -> str:
+    return page.get_text("text")
 
+
+# ---------------------------------------------------------------------------
+# Step 2 — Scanned-page detection
+# ---------------------------------------------------------------------------
+
+def is_scanned_page(page, page_text: str) -> bool:
+    """
+    True if the page is a raster scan rather than native-text PDF.
+    Heuristic: sparse selectable text + at least one embedded raster image.
+    """
+    if len(page_text.strip()) > 150:
+        return False
+    images = page.get_images(full=False)
+    return len(images) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — PaddleOCR (scanned pages)
+# ---------------------------------------------------------------------------
+
+def run_paddleocr(image_bytes: bytes) -> str:
+    """Run PaddleOCR on PNG bytes; return concatenated text lines."""
+    _init_paddle()
+    if not PADDLE_AVAILABLE or _paddle_ocr is None:
+        return ""
+    try:
+        import numpy as np
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img_array = np.array(img)
+        result = _paddle_ocr.ocr(img_array, cls=True)
+        lines = []
+        if result and result[0]:
+            for line in result[0]:
+                if line and len(line) >= 2:
+                    txt, conf = line[1]
+                    if conf > 0.4:
+                        lines.append(txt)
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"PaddleOCR error: {e}")
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Layout detection via PyMuPDF block/span structure
+# ---------------------------------------------------------------------------
+
+def detect_layout(page) -> dict:
+    """
+    Analyse PyMuPDF text dict to find room headers and confirm table presence.
+    Returns hints consumed by the LLM prompt.
+    """
+    try:
+        blocks = page.get_text("dict", flags=11)["blocks"]
+    except Exception:
+        return {"room_headers": [], "has_table": False}
+
+    room_headers = []
+    has_table = False
+    prev_y = 0.0
+
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "").strip()
+                flags = span.get("flags", 0)
+                size = span.get("size", 10)
+                y0 = span.get("origin", (0, 0))[1]
+                gap = y0 - prev_y
+                prev_y = y0
+
+                is_bold = bool(flags & 2**4)
+                is_large = size >= 11
+
+                if (is_bold or is_large) and gap > 6:
+                    if re.match(r"^[A-Z][A-Za-z\s/\-']{2,40}$", text):
+                        room_headers.append(text)
+
+                if re.search(r"\$[\d,]+|\d{3,}\.\d{2}", text):
+                    has_table = True
+
+    return {
+        "room_headers": list(dict.fromkeys(room_headers))[:20],
+        "has_table": has_table,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Page-type classification
+# ---------------------------------------------------------------------------
+
+def detect_page_type(page_text: str) -> str:
+    lower = page_text.lower()
     if any(x in lower for x in ["insured:", "claim number", "price list:", "date of loss", "date entered"]):
         return "cover"
     if "recap by room" in lower or "room recap" in lower:
@@ -66,30 +175,56 @@ def detect_page_type(page_text: str) -> str:
         return "recap_category"
     if ("replacement cost" in lower and "actual cash" in lower) and len(page_text) < 1500:
         return "summary"
-
     dollar_count = len(re.findall(r"\$[\d,]+\.?\d*|\b\d{1,3}(?:,\d{3})*\.\d{2}\b", page_text))
     if dollar_count >= 4:
         return "line_items"
-
     return "other"
 
 
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def normalize_description(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def parse_json_from_response(text: str) -> dict:
-    """Extract JSON from Claude's response, handling markdown code blocks."""
     text = text.strip()
     if "```" in text:
         m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
         if m:
             text = m.group(1).strip()
-    # Find first { ... } block
     m = re.search(r"\{[\s\S]*\}", text)
     if m:
         return json.loads(m.group())
     raise ValueError("No JSON object found in response")
 
 
-def extract_page_with_claude(image_bytes: bytes, page_num: int, page_type: str) -> dict:
-    """Send one page image to OpenRouter and return structured extraction."""
+def coerce_float(val) -> float:
+    if val is None:
+        return 0.0
+    try:
+        return float(str(val).replace(",", "").replace("$", "").strip() or 0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Step 6 — LLM extraction (image + OCR text + layout hints)
+# ---------------------------------------------------------------------------
+
+def extract_page_with_llm(
+    image_bytes: bytes,
+    page_num: int,
+    page_type: str,
+    ocr_text: str = "",
+    layout: Optional[dict] = None,
+) -> dict:
+    """Send page image (+ pre-extracted text) to OpenRouter vision LLM."""
     try:
         from openai import OpenAI
         client = OpenAI(
@@ -102,11 +237,23 @@ def extract_page_with_claude(image_bytes: bytes, page_num: int, page_type: str) 
 
     img_b64 = base64.standard_b64encode(image_bytes).decode()
 
-    if page_type == "cover":
-        prompt = """This is the cover or header page of an Xactimate insurance estimate PDF.
+    ocr_block = ""
+    if ocr_text.strip():
+        ocr_block = (
+            "\n\nPRE-EXTRACTED OCR TEXT — use to verify numbers; "
+            "prefer these values over your own reading when disagreement exists:\n"
+            f"```\n{ocr_text[:3000]}\n```"
+        )
 
-Extract all available information and return ONLY this JSON (use null for missing fields, 0.0 for missing numbers):
-{
+    layout_block = ""
+    if layout and layout.get("room_headers"):
+        headers = ", ".join(layout["room_headers"])
+        layout_block = f"\n\nDETECTED ROOM HEADERS ON THIS PAGE: {headers}"
+
+    if page_type == "cover":
+        prompt = f"""This is the cover/header page of an Xactimate insurance estimate PDF.
+Extract all available fields. Return ONLY this JSON (null for missing, 0.0 for missing numbers):
+{{
   "page_type": "cover",
   "insured_name": null,
   "claim_number": null,
@@ -122,45 +269,45 @@ Extract all available information and return ONLY this JSON (use null for missin
   "overhead_pct": 0.0,
   "profit_pct": 0.0,
   "line_items": []
-}"""
+}}{ocr_block}"""
 
     elif page_type == "recap_room":
-        prompt = """This is a 'Recap by Room' page from an Xactimate estimate PDF.
-Extract all room totals and return ONLY this JSON:
-{
+        prompt = f"""This is a 'Recap by Room' page from an Xactimate estimate PDF.
+Extract all room totals. Return ONLY this JSON:
+{{
   "page_type": "recap_room",
   "totals": [
-    {"name": "Room Name", "rcv": 0.0, "depreciation": 0.0, "acv": 0.0}
+    {{"name": "Room Name", "rcv": 0.0, "depreciation": 0.0, "acv": 0.0}}
   ],
   "line_items": []
-}"""
+}}{ocr_block}"""
 
     elif page_type == "recap_category":
-        prompt = """This is a 'Recap by Category' page from an Xactimate estimate PDF.
-Extract all category totals and return ONLY this JSON:
-{
+        prompt = f"""This is a 'Recap by Category' page from an Xactimate estimate PDF.
+Extract all category totals. Return ONLY this JSON:
+{{
   "page_type": "recap_category",
   "totals": [
-    {"code": "DRY", "name": "Drywall", "rcv": 0.0, "depreciation": 0.0, "acv": 0.0}
+    {{"code": "DRY", "name": "Drywall", "rcv": 0.0, "depreciation": 0.0, "acv": 0.0}}
   ],
   "line_items": []
-}"""
+}}{ocr_block}"""
 
     else:
-        prompt = """This is a line-item page from an Xactimate insurance estimate PDF.
+        prompt = f"""This is a line-item page from an Xactimate insurance estimate PDF.
 
-Xactimate structure:
-- Room section headers appear as bold/larger text with the room name (e.g., "KITCHEN", "Master Bedroom")
-- Each line item row has: Description | Qty | Unit | Unit Price | Tax | RCV | Dep% | Dep$ | ACV
-- The Description column often starts with a category code (2-4 uppercase letters like DRY, PNT, RFG, ELE, PCV, FCW, CAB, HVC, INS, WIN, DOR, FRM, MSC)
-- After the category code comes the selector code, then activity (R&R, Remove, Replace, etc.)
+Column order: Description | Qty | Unit | Unit Price | Tax | RCV | Dep% | Dep$ | ACV
+- Room section headers: bold/larger text (e.g. "KITCHEN", "Master Bedroom")
+- Category codes: 2-4 uppercase letters at start of description (DRY, PNT, RFG, ELE, PCV, FCW, CAB, HVC, INS, WIN, DOR, FRM, MSC …)
+- Activity codes: R&R, Remove, Replace, Detach & Reset, Install, Clean
+- Do NOT include room subtotal rows or page total rows{layout_block}{ocr_block}
 
-Extract EVERY line item on this page. Return ONLY this JSON:
-{
+Extract EVERY line item with a dollar amount in RCV. Return ONLY this JSON:
+{{
   "page_type": "line_items",
   "rooms_on_page": ["Room Name"],
   "line_items": [
-    {
+    {{
       "room_name": "Kitchen",
       "category_code": "DRY",
       "selector_code": "1/2",
@@ -173,17 +320,14 @@ Extract EVERY line item on this page. Return ONLY this JSON:
       "rcv": 526.75,
       "depreciation": 0.00,
       "acv": 526.75
-    }
+    }}
   ]
-}
+}}
 
 Rules:
-- Include every line item row that has a dollar amount in RCV column
-- Use 0.0 for any blank/dash numeric fields
-- room_name: use the most recent room header above the item; use "General" if none visible
-- category_code: the 2-4 letter code at start of description (null if not identifiable)
-- activity_code: R&R, Remove, Replace, Detach & Reset, Install, Clean, etc. (null if not present)
-- Do NOT include room subtotal rows or page total rows as line items"""
+- Use 0.0 for blank/dash fields
+- room_name: most recent room header above the item; "General" if none visible
+- If OCR text and image disagree on a dollar amount, prefer the OCR value"""
 
     try:
         response = client.chat.completions.create(
@@ -192,17 +336,11 @@ Rules:
             messages=[{
                 "role": "user",
                 "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{img_b64}",
-                        },
-                    },
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
                     {"type": "text", "text": prompt},
                 ],
             }],
         )
-
         raw = response.choices[0].message.content
         result = parse_json_from_response(raw)
         n = len(result.get("line_items", []))
@@ -210,27 +348,23 @@ Rules:
         return result
 
     except json.JSONDecodeError as e:
-        logger.error(f"  Page {page_num + 1}: JSON parse error — {e} | raw={raw[:300] if 'raw' in dir() else 'N/A'}")
+        raw_snippet = raw[:300] if "raw" in dir() else "N/A"
+        logger.error(f"  Page {page_num + 1}: JSON parse error — {e} | raw={raw_snippet}")
         return {"line_items": [], "page_type": page_type, "_error": f"JSON parse: {e}"}
     except Exception as e:
         logger.error(f"  Page {page_num + 1}: OpenRouter error — {type(e).__name__}: {e}")
         return {"line_items": [], "page_type": page_type, "_error": str(e)}
 
 
-def coerce_float(val) -> float:
-    """Safely convert a value to float."""
-    if val is None:
-        return 0.0
-    try:
-        return float(str(val).replace(",", "").replace("$", "").strip() or 0)
-    except (ValueError, TypeError):
-        return 0.0
-
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def extract_estimate(pdf_path: str, source: str) -> dict:
     """
-    Extract all line items from a PDF using Claude Vision, page by page.
-    Returns: {metadata, line_items, qa_results}
+    Full pipeline:
+      PDF → PyMuPDF → scan detection → PaddleOCR (if scanned) →
+      layout detection → LLM extraction → structured JSON
     """
     import fitz  # PyMuPDF
 
@@ -264,27 +398,54 @@ def extract_estimate(pdf_path: str, source: str) -> dict:
         }
 
     total_pages = len(doc)
-    logger.info(f"[{source}] Starting extraction of {total_pages} pages...")
+    logger.info(f"[{source}] Starting enhanced extraction of {total_pages} pages…")
 
     current_room = "General"
 
     for page_num in range(total_pages):
         page = doc[page_num]
-        page_text = page.get_text()
-        page_type = detect_page_type(page_text)
 
-        # Skip completely empty pages
-        if page_type == "other" and len(page_text.strip()) < 30:
+        # ── 1. PyMuPDF text ──────────────────────────────────────────────
+        page_text = get_pymupdf_text(page)
+
+        # ── 2. Scan detection ────────────────────────────────────────────
+        scanned = is_scanned_page(page, page_text)
+
+        if not scanned and len(page_text.strip()) < 30:
             logger.info(f"  Page {page_num + 1}/{total_pages}: empty — skip")
             continue
 
-        logger.info(f"  Page {page_num + 1}/{total_pages}: detected as '{page_type}'")
+        # ── 3. PaddleOCR (scanned pages only) ────────────────────────────
+        ocr_text = ""
+        if scanned:
+            logger.info(f"  Page {page_num + 1}/{total_pages}: scanned — running PaddleOCR")
+            image_bytes_ocr = render_page_to_png(page, dpi=200)
+            ocr_text = run_paddleocr(image_bytes_ocr)
+            effective_text = ocr_text if ocr_text else page_text
+        else:
+            effective_text = page_text
 
-        # Render and send to Claude
-        image_bytes = render_page_to_png(page, dpi=150)
-        result = extract_page_with_claude(image_bytes, page_num, page_type)
+        # ── 4. Layout detection ──────────────────────────────────────────
+        layout = detect_layout(page)
+        page_type = detect_page_type(effective_text)
 
-        # --- Handle cover page ---
+        logger.info(
+            f"  Page {page_num + 1}/{total_pages}: type='{page_type}' "
+            f"scanned={scanned} ocr_chars={len(ocr_text)} "
+            f"room_headers={layout.get('room_headers', [])[:3]}"
+        )
+
+        # ── 5. Render for LLM ────────────────────────────────────────────
+        image_bytes = render_page_to_png(page, dpi=200)
+
+        # ── 6. LLM extraction ────────────────────────────────────────────
+        result = extract_page_with_llm(
+            image_bytes, page_num, page_type,
+            ocr_text=ocr_text,
+            layout=layout,
+        )
+
+        # Cover page
         if page_type == "cover":
             for field in [
                 "insured_name", "claim_number", "date_entered", "price_list_code",
@@ -298,7 +459,7 @@ def extract_estimate(pdf_path: str, source: str) -> dict:
                 if val > 0:
                     metadata[field] = val
 
-        # --- Handle recap pages (store for QA) ---
+        # Recap room
         if page_type == "recap_room":
             for t in result.get("totals", []):
                 name = t.get("name", "")
@@ -306,37 +467,31 @@ def extract_estimate(pdf_path: str, source: str) -> dict:
                 if name and rcv:
                     recap_room_totals[name.lower().strip()] = rcv
 
-        # --- Track current room across pages ---
+        # Track current room
         rooms_on_page = result.get("rooms_on_page", [])
         if rooms_on_page:
             current_room = rooms_on_page[-1]
 
-        # --- Process line items ---
+        # Line items
         for item in result.get("line_items", []):
             if not item.get("room_name"):
                 item["room_name"] = current_room
 
-            # Coerce all numeric fields
             for field in ["qty", "unit_price", "tax", "rcv", "depreciation", "acv"]:
                 item[field] = coerce_float(item.get(field))
 
-            # Normalize description
             item["description_normalized"] = normalize_description(
                 item.get("description_raw", "")
             )
             item["source_page"] = page_num
             item["unit"] = str(item.get("unit") or "").strip()
 
-            # Flags
             desc_lower = item.get("description_raw", "").lower()
-            item["is_misc"] = (
-                item.get("category_code") == "MSC" or "misc" in desc_lower
-            )
+            item["is_misc"] = item.get("category_code") == "MSC" or "misc" in desc_lower
             item["is_code_upgrade"] = bool(
                 re.search(r"code\s+upgrade|ordinance|code\s+req", desc_lower)
             )
 
-            # Confidence: arithmetic check where possible
             qty = item["qty"]
             up = item["unit_price"]
             rcv = item["rcv"]
@@ -344,28 +499,28 @@ def extract_estimate(pdf_path: str, source: str) -> dict:
                 expected = qty * up
                 conf = 1.0 if abs(expected - rcv) / max(rcv, 0.01) <= 0.12 else 0.75
             else:
-                conf = 0.85  # Claude-extracted but no check
+                conf = 0.85
             item["extraction_confidence"] = conf
 
             all_line_items.append(item)
 
     doc.close()
 
-    # --- Backfill metadata totals from line items if missing ---
     if metadata["total_rcv"] == 0.0 and all_line_items:
         metadata["total_rcv"] = sum(i["rcv"] for i in all_line_items)
 
-    # --- QA ---
     if not all_line_items:
         qa_issues.append("No line items could be extracted from this PDF.")
         if not OPENROUTER_API_KEY:
-            qa_issues.append("OPENROUTER_API_KEY is not set — Vision extraction is disabled.")
+            qa_issues.append("OPENROUTER_API_KEY is not set — extraction is disabled.")
 
     valid = sum(1 for i in all_line_items if i["extraction_confidence"] >= 0.85)
     extraction_confidence = valid / max(len(all_line_items), 1)
 
     logger.info(
-        f"[{source}] Done: {len(all_line_items)} items, confidence={extraction_confidence:.2f}"
+        f"[{source}] Done: {len(all_line_items)} items, "
+        f"confidence={extraction_confidence:.2f}, "
+        f"paddle={'on' if PADDLE_AVAILABLE else 'off'}"
     )
 
     return {
