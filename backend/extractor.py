@@ -1,9 +1,17 @@
+"""
+Xactimate PDF Extractor — Claude Vision, page-by-page.
+Each page is rendered to an image and sent to Claude for structured extraction.
+"""
 import re
 import json
+import base64
 import logging
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 CATEGORY_NAMES = {
     "ACT": "Acoustical Treatment", "APL": "Appliances", "AWN": "Awnings",
@@ -26,49 +34,200 @@ CATEGORY_NAMES = {
     "WIN": "Windows", "WLD": "Welding",
 }
 
-ACTIVITY_CODES = {"RR", "REM", "REP", "RES", "DR", "DET", "INS", "CLN", "R&R", "LAB"}
-
-ROOM_KEYWORDS = {
-    "kitchen", "bath", "bathroom", "bedroom", "living", "dining", "garage",
-    "basement", "attic", "closet", "hallway", "hall", "office", "laundry",
-    "entry", "foyer", "porch", "deck", "exterior", "interior", "roof",
-    "general", "miscellaneous", "family room", "master", "bonus", "utility",
-    "sunroom", "mudroom", "pantry", "study", "library", "den",
-}
-
 
 def normalize_description(text: str) -> str:
-    """Normalize description for matching."""
     text = text.lower()
-    text = re.sub(r'[^a-z0-9\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def parse_money(text: str) -> float:
-    """Parse a money string like '$1,234.56' to float."""
-    if not text:
-        return 0.0
-    cleaned = re.sub(r'[^\d.\-]', '', text.replace(',', ''))
+def render_page_to_png(page, dpi: int = 150) -> bytes:
+    """Render a PyMuPDF page to PNG bytes."""
+    pix = page.get_pixmap(dpi=dpi)
+    return pix.tobytes("png")
+
+
+def detect_page_type(page_text: str) -> str:
+    """Quick heuristic to classify a page before sending to Claude."""
+    lower = page_text.lower()
+
+    if any(x in lower for x in ["insured:", "claim number", "price list:", "date of loss", "date entered"]):
+        return "cover"
+    if "recap by room" in lower or "room recap" in lower:
+        return "recap_room"
+    if "recap by category" in lower or "category recap" in lower:
+        return "recap_category"
+    if ("replacement cost" in lower and "actual cash" in lower) and len(page_text) < 1500:
+        return "summary"
+
+    dollar_count = len(re.findall(r"\$[\d,]+\.?\d*|\b\d{1,3}(?:,\d{3})*\.\d{2}\b", page_text))
+    if dollar_count >= 4:
+        return "line_items"
+
+    return "other"
+
+
+def parse_json_from_response(text: str) -> dict:
+    """Extract JSON from Claude's response, handling markdown code blocks."""
+    text = text.strip()
+    if "```" in text:
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if m:
+            text = m.group(1).strip()
+    # Find first { ... } block
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        return json.loads(m.group())
+    raise ValueError("No JSON object found in response")
+
+
+def extract_page_with_claude(image_bytes: bytes, page_num: int, page_type: str) -> dict:
+    """Send one page image to Claude and return structured extraction."""
     try:
-        return float(cleaned) if cleaned else 0.0
-    except ValueError:
-        return 0.0
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    except Exception as e:
+        logger.error(f"Claude client init failed: {e}")
+        return {"line_items": [], "page_type": page_type}
 
+    img_b64 = base64.standard_b64encode(image_bytes).decode()
 
-def parse_qty(text: str) -> float:
-    """Parse quantity string."""
-    if not text:
-        return 0.0
-    cleaned = re.sub(r'[^\d.\-]', '', text.replace(',', ''))
+    if page_type == "cover":
+        prompt = """This is the cover or header page of an Xactimate insurance estimate PDF.
+
+Extract all available information and return ONLY this JSON (use null for missing fields, 0.0 for missing numbers):
+{
+  "page_type": "cover",
+  "insured_name": null,
+  "claim_number": null,
+  "policy_number": null,
+  "date_of_loss": null,
+  "date_entered": null,
+  "price_list_code": null,
+  "estimator_name": null,
+  "company": null,
+  "property_address": null,
+  "total_rcv": 0.0,
+  "total_acv": 0.0,
+  "overhead_pct": 0.0,
+  "profit_pct": 0.0,
+  "line_items": []
+}"""
+
+    elif page_type == "recap_room":
+        prompt = """This is a 'Recap by Room' page from an Xactimate estimate PDF.
+Extract all room totals and return ONLY this JSON:
+{
+  "page_type": "recap_room",
+  "totals": [
+    {"name": "Room Name", "rcv": 0.0, "depreciation": 0.0, "acv": 0.0}
+  ],
+  "line_items": []
+}"""
+
+    elif page_type == "recap_category":
+        prompt = """This is a 'Recap by Category' page from an Xactimate estimate PDF.
+Extract all category totals and return ONLY this JSON:
+{
+  "page_type": "recap_category",
+  "totals": [
+    {"code": "DRY", "name": "Drywall", "rcv": 0.0, "depreciation": 0.0, "acv": 0.0}
+  ],
+  "line_items": []
+}"""
+
+    else:
+        prompt = """This is a line-item page from an Xactimate insurance estimate PDF.
+
+Xactimate structure:
+- Room section headers appear as bold/larger text with the room name (e.g., "KITCHEN", "Master Bedroom")
+- Each line item row has: Description | Qty | Unit | Unit Price | Tax | RCV | Dep% | Dep$ | ACV
+- The Description column often starts with a category code (2-4 uppercase letters like DRY, PNT, RFG, ELE, PCV, FCW, CAB, HVC, INS, WIN, DOR, FRM, MSC)
+- After the category code comes the selector code, then activity (R&R, Remove, Replace, etc.)
+
+Extract EVERY line item on this page. Return ONLY this JSON:
+{
+  "page_type": "line_items",
+  "rooms_on_page": ["Room Name"],
+  "line_items": [
+    {
+      "room_name": "Kitchen",
+      "category_code": "DRY",
+      "selector_code": "1/2",
+      "activity_code": "R&R",
+      "description_raw": "Drywall - hung, taped, heavy texture, ready for paint",
+      "qty": 245.00,
+      "unit": "SF",
+      "unit_price": 2.15,
+      "tax": 0.00,
+      "rcv": 526.75,
+      "depreciation": 0.00,
+      "acv": 526.75
+    }
+  ]
+}
+
+Rules:
+- Include every line item row that has a dollar amount in RCV column
+- Use 0.0 for any blank/dash numeric fields
+- room_name: use the most recent room header above the item; use "General" if none visible
+- category_code: the 2-4 letter code at start of description (null if not identifiable)
+- activity_code: R&R, Remove, Replace, Detach & Reset, Install, Clean, etc. (null if not present)
+- Do NOT include room subtotal rows or page total rows as line items"""
+
     try:
-        return float(cleaned) if cleaned else 0.0
-    except ValueError:
+        import anthropic
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": img_b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
+
+        raw = response.content[0].text
+        result = parse_json_from_response(raw)
+        n = len(result.get("line_items", []))
+        logger.info(f"  Page {page_num + 1}: {page_type} → {n} items extracted")
+        return result
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"  Page {page_num + 1}: JSON parse error — {e}")
+        return {"line_items": [], "page_type": page_type}
+    except Exception as e:
+        logger.warning(f"  Page {page_num + 1}: Claude error — {e}")
+        return {"line_items": [], "page_type": page_type}
+
+
+def coerce_float(val) -> float:
+    """Safely convert a value to float."""
+    if val is None:
+        return 0.0
+    try:
+        return float(str(val).replace(",", "").replace("$", "").strip() or 0)
+    except (ValueError, TypeError):
         return 0.0
 
 
-def extract_metadata_from_text(full_text: str) -> dict:
-    """Extract header metadata from the full text of the PDF."""
+def extract_estimate(pdf_path: str, source: str) -> dict:
+    """
+    Extract all line items from a PDF using Claude Vision, page by page.
+    Returns: {metadata, line_items, qa_results}
+    """
+    import fitz  # PyMuPDF
+
     metadata = {
         "insured_name": None,
         "claim_number": None,
@@ -77,454 +236,140 @@ def extract_metadata_from_text(full_text: str) -> dict:
         "estimator_name": None,
         "total_rcv": 0.0,
         "total_acv": 0.0,
-        "overhead_pct": 0.0,
-        "profit_pct": 0.0,
+        "overhead_pct": 10.0,
+        "profit_pct": 10.0,
     }
-
-    patterns = {
-        "insured_name": [
-            r"Insured\s*[:\-]\s*(.+?)(?:\n|Claim)",
-            r"insured\s*[:\-]\s*(.+?)(?:\n|$)",
-        ],
-        "claim_number": [
-            r"Claim\s*(?:Number|#|No\.?)\s*[:\-]\s*([A-Za-z0-9\-]+)",
-            r"Claim\s*[:\-]\s*([A-Za-z0-9\-]+)",
-        ],
-        "date_entered": [
-            r"Date\s*Entered\s*[:\-]\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
-            r"Date\s*[:\-]\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
-            r"Estimate\s*Date\s*[:\-]\s*(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})",
-        ],
-        "price_list_code": [
-            r"Price\s*List\s*[:\-]\s*([A-Z]{2,4}\d*[A-Z]*_[A-Z]{3}\d{2})",
-            r"Price\s*List\s*[:\-]\s*([A-Za-z0-9_\-]{5,20})",
-            r"\b([A-Z]{2,5}\d{1,2}[A-Z]_[A-Z]{3}\d{2})\b",
-        ],
-        "estimator_name": [
-            r"Estimator\s*[:\-]\s*(.+?)(?:\n|$)",
-            r"Prepared\s*by\s*[:\-]\s*(.+?)(?:\n|$)",
-        ],
-    }
-
-    for field, pattern_list in patterns.items():
-        for pattern in pattern_list:
-            match = re.search(pattern, full_text, re.IGNORECASE | re.MULTILINE)
-            if match:
-                metadata[field] = match.group(1).strip()
-                break
-
-    # Extract totals
-    rcv_patterns = [
-        r"Total\s*RCV\s*[:\-]?\s*\$?([\d,]+\.?\d*)",
-        r"Replacement\s*Cost\s*Value\s*[:\-]?\s*\$?([\d,]+\.?\d*)",
-        r"Grand\s*Total\s*[:\-]?\s*\$?([\d,]+\.?\d*)",
-    ]
-    for pattern in rcv_patterns:
-        match = re.search(pattern, full_text, re.IGNORECASE)
-        if match:
-            metadata["total_rcv"] = parse_money(match.group(1))
-            break
-
-    acv_patterns = [
-        r"Total\s*ACV\s*[:\-]?\s*\$?([\d,]+\.?\d*)",
-        r"Actual\s*Cash\s*Value\s*[:\-]?\s*\$?([\d,]+\.?\d*)",
-    ]
-    for pattern in acv_patterns:
-        match = re.search(pattern, full_text, re.IGNORECASE)
-        if match:
-            metadata["total_acv"] = parse_money(match.group(1))
-            break
-
-    # O&P
-    op_match = re.search(r"Overhead\s*[:\-]?\s*([\d.]+)\s*%", full_text, re.IGNORECASE)
-    if op_match:
-        metadata["overhead_pct"] = float(op_match.group(1))
-
-    profit_match = re.search(r"Profit\s*[:\-]?\s*([\d.]+)\s*%", full_text, re.IGNORECASE)
-    if profit_match:
-        metadata["profit_pct"] = float(profit_match.group(1))
-
-    return metadata
-
-
-def is_room_header(text: str) -> bool:
-    """Determine if a text line is likely a room header."""
-    stripped = text.strip()
-    if not stripped or len(stripped) < 2:
-        return False
-
-    # All caps check
-    if stripped.isupper() and 3 <= len(stripped) <= 60 and not re.search(r'\d{3}', stripped):
-        # Make sure it's not a category code line
-        if not re.match(r'^[A-Z]{2,4}\s', stripped):
-            return True
-
-    # Check for known room keywords
-    lower = stripped.lower()
-    for kw in ROOM_KEYWORDS:
-        if lower == kw or lower.startswith(kw + " ") or lower.endswith(" " + kw):
-            return True
-
-    return False
-
-
-def extract_category_and_codes(description: str):
-    """Extract category code, selector code, and activity code from a description."""
-    category_code = None
-    selector_code = None
-    activity_code = None
-
-    # Try to match known category codes at start
-    cat_match = re.match(r'^([A-Z]{2,4})\s+', description)
-    if cat_match and cat_match.group(1) in CATEGORY_NAMES:
-        category_code = cat_match.group(1)
-        rest = description[cat_match.end():]
-
-        # Try selector code
-        sel_match = re.match(r'([A-Z0-9]{2,10})\s+', rest)
-        if sel_match:
-            selector_code = sel_match.group(1)
-            rest = rest[sel_match.end():]
-
-        # Try activity code
-        act_match = re.match(r'(R&R|RR|REM|REP|RES|DR|DET|INS|CLN|LAB)\b', rest, re.IGNORECASE)
-        if act_match:
-            activity_code = act_match.group(1).upper()
-
-    if not category_code:
-        # Look for any category-like code
-        for code in CATEGORY_NAMES:
-            if re.search(r'\b' + code + r'\b', description):
-                category_code = code
-                break
-
-    # Look for activity code anywhere
-    if not activity_code:
-        act_match = re.search(r'\b(R&R|REM|REP|RES|DR|DET)\b', description, re.IGNORECASE)
-        if act_match:
-            activity_code = act_match.group(1).upper()
-
-    return category_code, selector_code, activity_code
-
-
-def spans_to_line_groups(page_dict: dict, y_tolerance: float = 3.0) -> list:
-    """Group spans by approximate y-coordinate (same line)."""
-    spans_flat = []
-    for block in page_dict.get("blocks", []):
-        if block.get("type") != 0:  # text block
-            continue
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                text = span.get("text", "").strip()
-                if text:
-                    bbox = span["bbox"]
-                    spans_flat.append({
-                        "text": text,
-                        "x0": bbox[0],
-                        "y0": bbox[1],
-                        "x1": bbox[2],
-                        "y1": bbox[3],
-                        "flags": span.get("flags", 0),
-                        "size": span.get("size", 10),
-                    })
-
-    if not spans_flat:
-        return []
-
-    # Group by y-coordinate
-    spans_flat.sort(key=lambda s: (round(s["y0"] / y_tolerance), s["x0"]))
-    groups = []
-    current_y = None
-    current_group = []
-
-    for span in spans_flat:
-        y_bucket = round(span["y0"] / y_tolerance)
-        if current_y is None:
-            current_y = y_bucket
-        if abs(y_bucket - current_y) <= 1:
-            current_group.append(span)
-        else:
-            if current_group:
-                groups.append(current_group)
-            current_group = [span]
-            current_y = y_bucket
-
-    if current_group:
-        groups.append(current_group)
-
-    return groups
-
-
-# Column x-boundaries for Xactimate line-item pages (approximate, in points)
-COLUMN_BOUNDS = {
-    "description": (0, 350),
-    "qty": (350, 400),
-    "unit": (400, 440),
-    "unit_price": (440, 510),
-    "tax": (510, 550),
-    "rcv": (550, 610),
-    "dep": (610, 660),
-    "acv": (660, 750),
-}
-
-
-def assign_column(x: float) -> Optional[str]:
-    """Assign a span to a column based on its x-coordinate."""
-    for col_name, (x_min, x_max) in COLUMN_BOUNDS.items():
-        if x_min <= x <= x_max:
-            return col_name
-    # Handle wider pages - scale proportionally
-    if x > 750:
-        return "acv"
-    return None
-
-
-def parse_line_item_from_group(group: list, current_room: str, page_num: int) -> Optional[dict]:
-    """Parse a span group into a line item dict."""
-    col_texts = {}
-    for span in group:
-        col = assign_column(span["x0"])
-        if col:
-            if col in col_texts:
-                col_texts[col] += " " + span["text"]
-            else:
-                col_texts[col] = span["text"]
-
-    description = col_texts.get("description", "").strip()
-    if not description or len(description) < 3:
-        return None
-
-    # Must have at least one numeric column to be a line item
-    has_numeric = any(
-        col in col_texts for col in ["qty", "unit_price", "rcv", "acv"]
-    )
-    if not has_numeric:
-        return None
-
-    qty = parse_qty(col_texts.get("qty", "0"))
-    unit_price = parse_money(col_texts.get("unit_price", "0"))
-    tax = parse_money(col_texts.get("tax", "0"))
-    rcv = parse_money(col_texts.get("rcv", "0"))
-    dep = parse_money(col_texts.get("dep", "0"))
-    acv = parse_money(col_texts.get("acv", "0"))
-    unit = col_texts.get("unit", "")
-
-    # Skip if all numeric values are zero (likely a header)
-    if rcv == 0 and qty == 0 and unit_price == 0:
-        return None
-
-    category_code, selector_code, activity_code = extract_category_and_codes(description)
-
-    is_misc = category_code == "MSC" or "misc" in description.lower()
-    is_code_upgrade = bool(re.search(r'code\s+upgrade|code\s+req', description, re.IGNORECASE))
-
-    # Calculate confidence: qty * unit_price should approximately equal rcv
-    conf = 1.0
-    if qty > 0 and unit_price > 0 and rcv > 0:
-        expected = qty * unit_price
-        if abs(expected - rcv) / max(rcv, 0.01) > 0.05:
-            conf = 0.7
-
-    return {
-        "room_name": current_room or "General",
-        "category_code": category_code,
-        "selector_code": selector_code,
-        "activity_code": activity_code,
-        "description_raw": description,
-        "description_normalized": normalize_description(description),
-        "qty": qty,
-        "unit": unit.strip(),
-        "unit_price": unit_price,
-        "tax": tax,
-        "rcv": rcv,
-        "depreciation": dep,
-        "acv": acv,
-        "source_page": page_num,
-        "is_misc": is_misc,
-        "is_code_upgrade": is_code_upgrade,
-        "extraction_confidence": conf,
-    }
-
-
-def extract_with_pdfplumber(pdf_path: str, page_num: int, current_room: str) -> list:
-    """Fallback extraction using pdfplumber for a specific page."""
-    items = []
-    try:
-        import pdfplumber
-        with pdfplumber.open(pdf_path) as pdf:
-            if page_num >= len(pdf.pages):
-                return items
-            page = pdf.pages[page_num]
-            table = page.extract_table()
-            if not table:
-                return items
-
-            for row in table:
-                if not row or not row[0]:
-                    continue
-                description = str(row[0]).strip()
-                if not description or len(description) < 3:
-                    continue
-
-                def safe_col(idx):
-                    if idx < len(row) and row[idx]:
-                        return str(row[idx])
-                    return "0"
-
-                qty = parse_qty(safe_col(1))
-                unit = safe_col(2) if len(row) > 2 else ""
-                unit_price = parse_money(safe_col(3))
-                tax = parse_money(safe_col(4))
-                rcv = parse_money(safe_col(5))
-                dep = parse_money(safe_col(6))
-                acv = parse_money(safe_col(7))
-
-                if rcv == 0 and qty == 0:
-                    continue
-
-                category_code, selector_code, activity_code = extract_category_and_codes(description)
-                conf = 1.0
-                if qty > 0 and unit_price > 0 and rcv > 0:
-                    expected = qty * unit_price
-                    if abs(expected - rcv) / max(rcv, 0.01) > 0.05:
-                        conf = 0.7
-
-                items.append({
-                    "room_name": current_room or "General",
-                    "category_code": category_code,
-                    "selector_code": selector_code,
-                    "activity_code": activity_code,
-                    "description_raw": description,
-                    "description_normalized": normalize_description(description),
-                    "qty": qty,
-                    "unit": unit.strip(),
-                    "unit_price": unit_price,
-                    "tax": tax,
-                    "rcv": rcv,
-                    "depreciation": dep,
-                    "acv": acv,
-                    "source_page": page_num,
-                    "is_misc": category_code == "MSC",
-                    "is_code_upgrade": bool(re.search(r'code\s+upgrade', description, re.IGNORECASE)),
-                    "extraction_confidence": conf,
-                })
-    except Exception as e:
-        logger.warning(f"pdfplumber fallback failed on page {page_num}: {e}")
-
-    return items
-
-
-def extract_estimate(pdf_path: str, source: str) -> dict:
-    """
-    Extract estimate data from a PDF file.
-    Returns dict with metadata, line_items, and qa_results.
-    """
-    import fitz  # PyMuPDF
-
-    line_items = []
-    full_text_parts = []
-    current_room = "General"
+    all_line_items = []
     qa_issues = []
+    recap_room_totals = {}
 
     try:
         doc = fitz.open(pdf_path)
     except Exception as e:
         return {
-            "metadata": {},
+            "metadata": metadata,
             "line_items": [],
-            "qa_results": {"passed": False, "issues": [f"Failed to open PDF: {e}"]},
+            "qa_results": {
+                "passed": False,
+                "issues": [f"Cannot open PDF: {e}"],
+                "extraction_confidence": 0.0,
+                "total_items": 0,
+            },
         }
 
-    # Check if text-based
-    total_chars = 0
-    for page in doc:
-        total_chars += len(page.get_text())
+    total_pages = len(doc)
+    logger.info(f"[{source}] Starting extraction of {total_pages} pages...")
 
-    if total_chars < 100:
-        qa_issues.append("PDF appears to be image-based; extraction quality may be poor")
+    current_room = "General"
 
-    # Extract full text from first 3 pages for metadata
-    header_text = ""
-    for i in range(min(3, len(doc))):
-        header_text += doc[i].get_text()
-    full_text_parts.append(header_text)
-
-    metadata = extract_metadata_from_text(header_text)
-
-    # Extract all pages for line items
-    for page_num in range(len(doc)):
+    for page_num in range(total_pages):
         page = doc[page_num]
-        page_dict = page.get_text("dict")
-        full_text_parts.append(page.get_text())
+        page_text = page.get_text()
+        page_type = detect_page_type(page_text)
 
-        groups = spans_to_line_groups(page_dict)
-        page_items = []
+        # Skip completely empty pages
+        if page_type == "other" and len(page_text.strip()) < 30:
+            logger.info(f"  Page {page_num + 1}/{total_pages}: empty — skip")
+            continue
 
-        for group in groups:
-            # Check if this group is a room header
-            group_text = " ".join(s["text"] for s in group).strip()
+        logger.info(f"  Page {page_num + 1}/{total_pages}: detected as '{page_type}'")
 
-            if is_room_header(group_text):
-                # Check that it's not just a category line
-                if len(group) <= 3 and not any(
-                    assign_column(s["x0"]) in ["qty", "rcv", "acv"] for s in group
-                ):
-                    current_room = group_text.title()
-                    continue
+        # Render and send to Claude
+        image_bytes = render_page_to_png(page, dpi=150)
+        result = extract_page_with_claude(image_bytes, page_num, page_type)
 
-            item = parse_line_item_from_group(group, current_room, page_num)
-            if item:
-                page_items.append(item)
+        # --- Handle cover page ---
+        if page_type == "cover":
+            for field in [
+                "insured_name", "claim_number", "date_entered", "price_list_code",
+                "estimator_name", "overhead_pct", "profit_pct",
+            ]:
+                val = result.get(field)
+                if val not in (None, "", 0, 0.0):
+                    metadata[field] = val
+            for field in ["total_rcv", "total_acv"]:
+                val = coerce_float(result.get(field))
+                if val > 0:
+                    metadata[field] = val
 
-        # Fallback to pdfplumber if few items found
-        if len(page_items) < 5 and page_num > 0:
-            fallback_items = extract_with_pdfplumber(pdf_path, page_num, current_room)
-            if len(fallback_items) > len(page_items):
-                page_items = fallback_items
+        # --- Handle recap pages (store for QA) ---
+        if page_type == "recap_room":
+            for t in result.get("totals", []):
+                name = t.get("name", "")
+                rcv = coerce_float(t.get("rcv"))
+                if name and rcv:
+                    recap_room_totals[name.lower().strip()] = rcv
 
-        line_items.extend(page_items)
+        # --- Track current room across pages ---
+        rooms_on_page = result.get("rooms_on_page", [])
+        if rooms_on_page:
+            current_room = rooms_on_page[-1]
+
+        # --- Process line items ---
+        for item in result.get("line_items", []):
+            if not item.get("room_name"):
+                item["room_name"] = current_room
+
+            # Coerce all numeric fields
+            for field in ["qty", "unit_price", "tax", "rcv", "depreciation", "acv"]:
+                item[field] = coerce_float(item.get(field))
+
+            # Normalize description
+            item["description_normalized"] = normalize_description(
+                item.get("description_raw", "")
+            )
+            item["source_page"] = page_num
+            item["unit"] = str(item.get("unit") or "").strip()
+
+            # Flags
+            desc_lower = item.get("description_raw", "").lower()
+            item["is_misc"] = (
+                item.get("category_code") == "MSC" or "misc" in desc_lower
+            )
+            item["is_code_upgrade"] = bool(
+                re.search(r"code\s+upgrade|ordinance|code\s+req", desc_lower)
+            )
+
+            # Confidence: arithmetic check where possible
+            qty = item["qty"]
+            up = item["unit_price"]
+            rcv = item["rcv"]
+            if qty > 0 and up > 0 and rcv > 0:
+                expected = qty * up
+                conf = 1.0 if abs(expected - rcv) / max(rcv, 0.01) <= 0.12 else 0.75
+            else:
+                conf = 0.85  # Claude-extracted but no check
+            item["extraction_confidence"] = conf
+
+            all_line_items.append(item)
 
     doc.close()
 
-    # If metadata totals are missing, try full text
-    if metadata["total_rcv"] == 0:
-        full_text = "\n".join(full_text_parts)
-        meta2 = extract_metadata_from_text(full_text)
-        if meta2["total_rcv"] > 0:
-            metadata["total_rcv"] = meta2["total_rcv"]
-        if meta2["total_acv"] > 0:
-            metadata["total_acv"] = meta2["total_acv"]
+    # --- Backfill metadata totals from line items if missing ---
+    if metadata["total_rcv"] == 0.0 and all_line_items:
+        metadata["total_rcv"] = sum(i["rcv"] for i in all_line_items)
 
-    # QA check: validate qty * unit_price ~ rcv
-    valid_count = 0
-    total_count = 0
-    for item in line_items:
-        if item["qty"] > 0 and item["unit_price"] > 0 and item["rcv"] > 0:
-            total_count += 1
-            expected = item["qty"] * item["unit_price"]
-            if abs(expected - item["rcv"]) / max(item["rcv"], 0.01) <= 0.05:
-                valid_count += 1
-            else:
-                item["extraction_confidence"] = 0.7
+    # --- QA ---
+    if not all_line_items:
+        qa_issues.append("No line items could be extracted from this PDF.")
+        if not ANTHROPIC_API_KEY:
+            qa_issues.append("ANTHROPIC_API_KEY is not set — Claude Vision is disabled.")
 
-    extraction_confidence = valid_count / max(total_count, 1)
-    if extraction_confidence < 0.5:
-        qa_issues.append(
-            f"Only {valid_count}/{total_count} line items pass qty*price≈rcv check"
-        )
+    valid = sum(1 for i in all_line_items if i["extraction_confidence"] >= 0.85)
+    extraction_confidence = valid / max(len(all_line_items), 1)
 
-    if not line_items:
-        qa_issues.append("No line items extracted from PDF")
-
-    qa_passed = len(qa_issues) == 0
+    logger.info(
+        f"[{source}] Done: {len(all_line_items)} items, confidence={extraction_confidence:.2f}"
+    )
 
     return {
         "metadata": metadata,
-        "line_items": line_items,
+        "line_items": all_line_items,
         "qa_results": {
-            "passed": qa_passed,
+            "passed": len(qa_issues) == 0,
             "issues": qa_issues,
             "extraction_confidence": extraction_confidence,
-            "total_items": len(line_items),
+            "total_items": len(all_line_items),
+            "recap_room_totals": recap_room_totals,
         },
     }
