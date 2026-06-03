@@ -11,7 +11,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+# Any vision-capable model on OpenRouter works, e.g.:
+#   google/gemini-2.0-flash-exp:free
+#   anthropic/claude-sonnet-4-5
+#   openai/gpt-4o
+#   openai/gpt-4o-mini
+VISION_MODEL = os.environ.get("VISION_MODEL", "google/gemini-2.0-flash-exp:free")
 
 CATEGORY_NAMES = {
     "ACT": "Acoustical Treatment", "APL": "Appliances", "AWN": "Awnings",
@@ -83,12 +89,15 @@ def parse_json_from_response(text: str) -> dict:
 
 
 def extract_page_with_claude(image_bytes: bytes, page_num: int, page_type: str) -> dict:
-    """Send one page image to Claude and return structured extraction."""
+    """Send one page image to OpenRouter and return structured extraction."""
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        from openai import OpenAI
+        client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+        )
     except Exception as e:
-        logger.error(f"Claude client init failed: {e}")
+        logger.error(f"OpenRouter client init failed: {e}")
         return {"line_items": [], "page_type": page_type}
 
     img_b64 = base64.standard_b64encode(image_bytes).decode()
@@ -177,19 +186,16 @@ Rules:
 - Do NOT include room subtotal rows or page total rows as line items"""
 
     try:
-        import anthropic
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
+        response = client.chat.completions.create(
+            model=VISION_MODEL,
             max_tokens=4096,
             messages=[{
                 "role": "user",
                 "content": [
                     {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": img_b64,
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{img_b64}",
                         },
                     },
                     {"type": "text", "text": prompt},
@@ -197,7 +203,7 @@ Rules:
             }],
         )
 
-        raw = response.content[0].text
+        raw = response.choices[0].message.content
         result = parse_json_from_response(raw)
         n = len(result.get("line_items", []))
         logger.info(f"  Page {page_num + 1}: {page_type} → {n} items extracted")
@@ -352,8 +358,8 @@ def extract_estimate(pdf_path: str, source: str) -> dict:
     # --- QA ---
     if not all_line_items:
         qa_issues.append("No line items could be extracted from this PDF.")
-        if not ANTHROPIC_API_KEY:
-            qa_issues.append("ANTHROPIC_API_KEY is not set — Claude Vision is disabled.")
+        if not OPENROUTER_API_KEY:
+            qa_issues.append("OPENROUTER_API_KEY is not set — Vision extraction is disabled.")
 
     valid = sum(1 for i in all_line_items if i["extraction_confidence"] >= 0.85)
     extraction_confidence = valid / max(len(all_line_items), 1)
